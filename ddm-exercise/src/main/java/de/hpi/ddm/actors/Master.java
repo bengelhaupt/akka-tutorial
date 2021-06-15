@@ -5,16 +5,14 @@ import de.hpi.ddm.structures.BloomFilter;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
-import org.apache.commons.lang3.ArrayUtils;
 
 import java.io.Serializable;
-import java.io.UnsupportedEncodingException;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class Master extends AbstractLoggingActor {
 
@@ -60,6 +58,16 @@ public class Master extends AbstractLoggingActor {
         private static final long serialVersionUID = 7033566951826394411L;
         private String id;
         private char missingCharacter;
+        private String hashedHint;
+    }
+
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class CrackHintNoResultMessage implements Serializable {
+        private static final long serialVersionUID = 606002318005377669L;
+        private String id;
+        private char missingCharacter;
     }
 
     @Data
@@ -68,7 +76,7 @@ public class Master extends AbstractLoggingActor {
     public static class CrackPasswordResultMessage implements Serializable {
         private static final long serialVersionUID = 6194489711561811313L;
         private String id;
-        private String password;
+        private char[] password;
     }
 
     @Data
@@ -92,10 +100,16 @@ public class Master extends AbstractLoggingActor {
         public void run(ActorRef worker);
     }
 
+    private ConcurrentMap<String, String> passwords = new ConcurrentHashMap<>();
+    private ConcurrentMap<String, char[]> alphabets = new ConcurrentHashMap<>();
+    private ConcurrentMap<String, char[]> remainingCharacters = new ConcurrentHashMap<>();
+    private ConcurrentMap<String, char[]> remainingPasswordCharacters = new ConcurrentHashMap<>();
+    private ConcurrentMap<String, Integer> passwordLengths = new ConcurrentHashMap<>();
+    private ConcurrentMap<String, String[]> remainingHints = new ConcurrentHashMap<>();
+
     private CopyOnWriteArrayList<WorkerTask> pendingTasks = new CopyOnWriteArrayList<>();
-    private ConcurrentMap<String, String[]> lines = new ConcurrentHashMap<>();
+    private AtomicInteger workerCount = new AtomicInteger(0);
     private CopyOnWriteArrayList<ActorRef> availableWorkers = new CopyOnWriteArrayList<>();
-    private ConcurrentMap<String, List<Character>> solvedHints = new ConcurrentHashMap<>();
     private boolean readAll = false;
 
     /////////////////////
@@ -119,6 +133,7 @@ public class Master extends AbstractLoggingActor {
                 .match(Terminated.class, this::handle)
                 .match(RegistrationMessage.class, this::handle)
                 .match(CrackHintResultMessage.class, this::handle)
+                .match(CrackHintNoResultMessage.class, this::handle)
                 .match(CrackPasswordResultMessage.class, this::handle)
                 .matchAny(object -> this.log().info("Received unknown message: \"{}\"", object.toString()))
                 .build();
@@ -153,36 +168,30 @@ public class Master extends AbstractLoggingActor {
             return;
         }
 
-        Map<Character, List<String>> permutationsMap = new HashMap<>();
-
-        String[] firstLine = message.getLines().get(0);
-        char[] alphabet = firstLine[2].toCharArray();
-        int passwordLength = Integer.parseInt(firstLine[3]);
-        for (int i = 0; i < alphabet.length; i++) {
-            char missingCharacter = alphabet[i];
-            char[] alphabetWithoutOne = new char[alphabet.length - 1];
-            System.arraycopy(alphabet, 0, alphabetWithoutOne, 0, i);
-            System.arraycopy(alphabet, i + 1, alphabetWithoutOne, i, alphabetWithoutOne.length - i);
-
-            List<String> permutations = new ArrayList();
-            heapPermutation(alphabetWithoutOne, passwordLength, permutations);
-
-            permutationsMap.put(missingCharacter, permutations);
-        }
-
-        log("processing input lines");
+        this.log().info("processing input lines");
         // TODO: Process the lines with the help of the worker actors
         for (String[] line : message.getLines()) {
-            lines.put(line[0], line);
+            String id = line[0];
+            char[] alphabet = line[2].toCharArray();
+            int hintLength = Integer.parseInt(line[3]);
 
             String[] hintHashes = new String[line.length - 5];
             System.arraycopy(line, 5, hintHashes, 0, hintHashes.length);
 
+            passwords.put(id, line[4]);
+            alphabets.put(id, alphabet);
+            remainingCharacters.put(id, alphabet);
+            remainingPasswordCharacters.put(id, new char[0]);
+            remainingHints.put(id, hintHashes);
+            passwordLengths.put(id, hintLength);
+
             pendingTasks.add(worker -> {
-                log("start hint cracking for "+line[0]);
-                worker.tell(new Worker.CrackHintsMessage(line[0], hintHashes, permutationsMap), this.self());
+                //this.log().info("start hint cracking for " + id);
+                worker.tell(new Worker.CrackHintMessage(id, hintHashes, alphabet, hintLength, alphabet[0]), this.self());
             });
         }
+
+        doNextTask();
 
         // TODO: Fetch further lines from the Reader
         this.reader.tell(new Reader.ReadMessage(), this.self());
@@ -190,43 +199,96 @@ public class Master extends AbstractLoggingActor {
     }
 
     protected void handle(CrackHintResultMessage message) {
-        log("received hint crack result for " + message.id);
+        this.log().info("received hint crack result for " + message.id + " and character " + message.missingCharacter);
 
-        List<Character> l = solvedHints.getOrDefault(message.id, new ArrayList<>());
-        l.add(message.missingCharacter);
-        solvedHints.put(message.id, l);
+        availableWorkers.add(this.sender());
 
-        if (solvedHints.size() == lines.get(message.id).length - 5) {
-            availableWorkers.add(this.sender());
+        char[] alphabet = remainingCharacters.get(message.id);
+        char[] remainingAlphabetChars = new char[alphabet.length - 1];
+        for (int i = 0; i < alphabet.length; i++) {
+            if (alphabet[i] == message.missingCharacter) {
+                System.arraycopy(alphabet, 0, remainingAlphabetChars, 0, i);
+                System.arraycopy(alphabet, i + 1, remainingAlphabetChars, i, remainingAlphabetChars.length - i);
+            }
+        }
+        remainingCharacters.put(message.id, remainingAlphabetChars);
+
+        String[] hints = remainingHints.get(message.id);
+        String[] remainingHintsArray = new String[hints.length - 1];
+        for (int i = 0; i < hints.length; i++) {
+            if (hints[i].equals(message.hashedHint)) {
+                System.arraycopy(hints, 0, remainingHintsArray, 0, i);
+                System.arraycopy(hints, i + 1, remainingHintsArray, i, remainingHintsArray.length - i);
+            }
+        }
+        remainingHints.put(message.id, remainingHintsArray);
+
+        if (remainingHintsArray.length <= 2) {
             pendingTasks.add(worker -> {
-                List<Character> alphabetList = new ArrayList<>(Arrays.asList(ArrayUtils.toObject(lines.get(message.id)[2].toCharArray())));
-                alphabetList.removeAll(solvedHints.get(message.id));
-                char[] remainingAlphabetChars = ArrayUtils.toPrimitive(alphabetList.toArray(new Character[0]));
-
-                log("starting to crack password of "+ message.id);
-                worker.tell(new Worker.CrackPasswordMessage(message.id, lines.get(message.id)[4], remainingAlphabetChars, Integer.parseInt(lines.get(message.id)[3])), this.self());
+                char[] remainingPasswordChars = remainingPasswordCharacters.get(message.id);
+                char[] passwordAlphabet = new char[remainingAlphabetChars.length + remainingPasswordChars.length];
+                System.arraycopy(remainingPasswordChars, 0, passwordAlphabet, 0, remainingPasswordChars.length);
+                System.arraycopy(remainingAlphabetChars, 0, passwordAlphabet, remainingPasswordChars.length, remainingAlphabetChars.length);
+                this.log().info("starting to crack password of " + message.id + " with remaining characters " + new String(passwordAlphabet));
+                worker.tell(new Worker.CrackPasswordMessage(message.id, passwords.get(message.id), passwordAlphabet, passwordLengths.get(message.id)), this.self());
+            });
+        } else {
+            pendingTasks.add(worker -> {
+                //this.log().info("start hint cracking for " + message.id);
+                worker.tell(new Worker.CrackHintMessage(message.id, remainingHintsArray, alphabets.get(message.id), passwordLengths.get(message.id), remainingAlphabetChars[0]), this.self());
             });
         }
+
+        doNextTask();
+    }
+
+    protected void handle(CrackHintNoResultMessage message) {
+        this.log().info("received no hint crack result for " + message.id + " and character " + message.missingCharacter);
+
+        availableWorkers.add(this.sender());
+
+        char[] alphabet = remainingCharacters.get(message.id);
+        char[] remainingAlphabetChars = new char[alphabet.length - 1];
+        for (int i = 0; i < alphabet.length; i++) {
+            if (alphabet[i] == message.missingCharacter) {
+                System.arraycopy(alphabet, 0, remainingAlphabetChars, 0, i);
+                System.arraycopy(alphabet, i + 1, remainingAlphabetChars, i, remainingAlphabetChars.length - i);
+            }
+        }
+        remainingCharacters.put(message.id, remainingAlphabetChars);
+
+        char[] passwordChars = remainingPasswordCharacters.get(message.id);
+        char[] newPasswordChars = new char[passwordChars.length + 1];
+        System.arraycopy(passwordChars, 0, newPasswordChars, 0, passwordChars.length);
+        newPasswordChars[passwordChars.length] = message.missingCharacter;
+        remainingPasswordCharacters.put(message.id, newPasswordChars);
+
+        pendingTasks.add(worker -> {
+            //this.log().info("start hint cracking for " + message.id);
+            worker.tell(new Worker.CrackHintMessage(message.id, remainingHints.get(message.id), alphabets.get(message.id), passwordLengths.get(message.id), remainingAlphabetChars[0]), this.self());
+        });
+
+        doNextTask();
     }
 
     protected void handle(CrackPasswordResultMessage message) {
-        this.log().info("received password crack result for {} ({})", message.id, message.password);
+        this.log().info("received password crack result for " + message.id + "(" + new String(message.password) + ")");
+
+        this.collector.tell(new Collector.CollectMessage("user " + message.id + " has password " + new String(message.password)), this.self());
+
         availableWorkers.add(this.sender());
         doNextTask();
-
-        lines.get(message.id)[4] = message.password;
-        this.collector.tell(new Collector.CollectMessage(Arrays.toString(lines.get(message.id))), this.self());
     }
 
     protected void doNextTask() {
-        if (readAll && pendingTasks.isEmpty()) {
-            log("no tasks remaining, exiting");
+        if (readAll && pendingTasks.isEmpty() && availableWorkers.size() == workerCount.get()) {
+            this.log().info("no tasks and no occupied workers remaining, exiting...");
             this.terminate();
             return;
         }
 
         while (!availableWorkers.isEmpty() && !pendingTasks.isEmpty()) {
-            log(availableWorkers.size() + " available workers and " + pendingTasks.size() + " pending tasks");
+            //this.log().info(availableWorkers.size() + " available workers and " + pendingTasks.size() + " pending tasks");
             WorkerTask t = pendingTasks.remove(0);
             ActorRef w = availableWorkers.remove(0);
             t.run(w);
@@ -260,6 +322,7 @@ public class Master extends AbstractLoggingActor {
 
         // TODO: Assign some work to registering workers. Note that the processing of the global task might have already started.
         this.availableWorkers.add(this.sender());
+        this.workerCount.incrementAndGet();
         doNextTask();
     }
 
@@ -269,51 +332,6 @@ public class Master extends AbstractLoggingActor {
         this.log().info("Unregistered {}", message.getActor());
 
         this.availableWorkers.remove(message.getActor());
-    }
-
-    private void log(String s){
-        System.out.println(s);
-    }
-
-    private String hash(String characters) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hashedBytes = digest.digest(String.valueOf(characters).getBytes("UTF-8"));
-
-            StringBuffer stringBuffer = new StringBuffer();
-            for (int i = 0; i < hashedBytes.length; i++) {
-                stringBuffer.append(Integer.toString((hashedBytes[i] & 0xff) + 0x100, 16).substring(1));
-            }
-            return stringBuffer.toString();
-        } catch (NoSuchAlgorithmException | UnsupportedEncodingException e) {
-            throw new RuntimeException(e.getMessage());
-        }
-    }
-
-    // Generating all permutations of an array using Heap's Algorithm
-    // https://en.wikipedia.org/wiki/Heap's_algorithm
-    // https://www.geeksforgeeks.org/heaps-algorithm-for-generating-permutations/
-    private void heapPermutation(char[] a, int size, List<String> l) {
-        // If size is 1, store the obtained permutation
-        if (size == 1)
-            l.add(new String(a));
-
-        for (int i = 0; i < size; i++) {
-            heapPermutation(a, size - 1, l);
-
-            // If size is odd, swap first and last element
-            if (size % 2 == 1) {
-                char temp = a[0];
-                a[0] = a[size - 1];
-                a[size - 1] = temp;
-            }
-
-            // If size is even, swap i-th and last element
-            else {
-                char temp = a[i];
-                a[i] = a[size - 1];
-                a[size - 1] = temp;
-            }
-        }
+        this.workerCount.getAndDecrement();
     }
 }
